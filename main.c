@@ -192,7 +192,8 @@ init_vk(struct vkcube *vc, const char *extension)
    vkCreateDevice(vc->physical_device,
                   &(VkDeviceCreateInfo) {
                      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                     .queueCreateInfoCount = 1,
+                     .pNext = &features,
+		     .queueCreateInfoCount = 1,
                      .pQueueCreateInfos = &(VkDeviceQueueCreateInfo) {
                         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                         .queueFamilyIndex = 0,
@@ -466,11 +467,7 @@ init_headless(struct vkcube *vc)
    return 0;
 }
 
-#ifdef HAVE_VULKAN_INTEL_H
-
 /* KMS display code - render to kernel modesetting fb */
-
-#include <vulkan/vulkan_intel.h>
 
 static struct termios save_tio;
 
@@ -551,9 +548,8 @@ init_kms(struct vkcube *vc)
    if (init_vt(vc) == -1)
       return -1;
 
-   vc->fd = open("/dev/dri/card0", O_RDWR);
+   vc->fd = open("/dev/dri/card1", O_RDWR);
    fail_if(vc->fd == -1, "failed to open /dev/dri/card0\n");
-
    /* Get KMS resources and find the first active connecter. We'll use that
       connector and the crtc driving it in the mode it's currently running. */
    resources = drmModeGetResources(vc->fd);
@@ -580,36 +576,91 @@ init_kms(struct vkcube *vc)
    vc->height = vc->crtc->mode.vdisplay;
 
    vc->gbm_device = gbm_create_device(vc->fd);
-
    init_vk(vc, NULL);
    vc->image_format = VK_FORMAT_R8G8B8A8_SRGB;
    init_vk_objects(vc);
 
-   PFN_vkCreateDmaBufImageINTEL create_dma_buf_image =
-      (PFN_vkCreateDmaBufImageINTEL)vkGetDeviceProcAddr(vc->device, "vkCreateDmaBufImageINTEL");
-
    for (uint32_t i = 0; i < 2; i++) {
       struct vkcube_buffer *b = &vc->buffers[i];
       int fd, stride, ret;
+     
+      uint64_t mod = DRM_FORMAT_MOD_LINEAR;
 
-      b->gbm_bo = gbm_bo_create(vc->gbm_device, vc->width, vc->height,
-                                GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT);
+      uint32_t flags = 0;
+      flags |=  GBM_BO_USE_SCANOUT |
+	      (vc->protected? GBM_BO_USE_PROTECTED : 0);
+      b->gbm_bo = gbm_bo_create_with_modifiers2(vc->gbm_device, vc->width, vc->height, GBM_FORMAT_XRGB8888, &mod, 1, flags);
+      
 
       fd = gbm_bo_get_fd(b->gbm_bo);
       stride = gbm_bo_get_stride(b->gbm_bo);
-      create_dma_buf_image(vc->device,
-                           &(VkDmaBufImageCreateInfo) {
-                              .sType = VK_STRUCTURE_TYPE_DMA_BUF_IMAGE_CREATE_INFO_INTEL,
-                              .fd = fd,
-                              .format = vc->image_format,
-                              .extent = { vc->width, vc->height, 1 },
-                              .strideInBytes = stride
-                           },
-                           NULL,
-                           &b->mem,
-                           &b->image);
-      close(fd);
 
+      VkImageCreateInfo img_info = {
+	      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	      .imageType = VK_IMAGE_TYPE_2D,
+	      .format = vc->image_format,
+              .extent = { .width = vc->width, .height = vc->height, .depth = 1 },
+	      .mipLevels = 1,
+	      .arrayLayers = 1,
+	      .samples = 1,
+	      .tiling = VK_IMAGE_TILING_LINEAR,
+	      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+	      .flags = vc->protected ? VK_IMAGE_CREATE_PROTECTED_BIT : 0,
+      };
+	
+      VkExternalMemoryImageCreateInfo eimg = {0};
+      eimg.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+      eimg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+      img_info.pNext = &eimg;
+
+      VkSubresourceLayout plane_layouts[1] = {0};
+      plane_layouts[0].offset = 0;
+      plane_layouts[0].rowPitch = stride;
+      plane_layouts[0].arrayPitch = 0;
+      plane_layouts[0].depthPitch = 0;
+      plane_layouts[0].size = 0;
+
+
+      VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info = {0};
+      mod_info.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+      mod_info.drmFormatModifierPlaneCount = 1;
+      mod_info.drmFormatModifier = mod;
+      mod_info.pPlaneLayouts = plane_layouts;
+      eimg.pNext = &mod_info;
+      
+      vkCreateImage(vc->device, &img_info, NULL, &b->image);
+
+      VkMemoryRequirements memRequirements;
+      vkGetImageMemoryRequirements(vc->device, b->image, &memRequirements);
+
+      VkImageSubresource subresource = {};
+      subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      subresource.mipLevel = 0;
+      subresource.arrayLayer = 0;
+
+      VkSubresourceLayout layout = {};
+
+      vkGetImageSubresourceLayout(vc->device, b->image, &subresource, &layout);
+
+      int32_t mem_type = choose_memory_type_index(vc, memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+      VkMemoryAllocateInfo memi = {0};
+      memi.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      memi.allocationSize = memRequirements.size;
+      memi.memoryTypeIndex = mem_type;
+      
+      VkImportMemoryFdInfoKHR importi = {0};
+      importi.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+      importi.fd = fd;
+      importi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+      memi.pNext = &importi;
+      vkAllocateMemory(vc->device, &memi, NULL, &b->mem);
+      
+      vkBindImageMemory(vc->device, b->image, b->mem, 0);
+      
+      close(fd);
       b->stride = gbm_bo_get_stride(b->gbm_bo);
       uint32_t bo_handles[4] = { gbm_bo_get_handle(b->gbm_bo).s32, };
       uint32_t pitches[4] = { stride, };
@@ -617,11 +668,10 @@ init_kms(struct vkcube *vc)
       ret = drmModeAddFB2(vc->fd, vc->width, vc->height,
                           DRM_FORMAT_XRGB8888, bo_handles,
                           pitches, offsets, &b->fb, 0);
-      fail_if(ret == -1, "addfb2 failed\n");
 
+      fail_if(ret == -1, "addfb2 failed\n");
       init_buffer(vc, b);
    }
-
    return 0;
 }
 
@@ -683,21 +733,6 @@ mainloop_vt(struct vkcube *vc)
       }
    }
 }
-
-#else
-
-static int
-init_kms(struct vkcube *vc)
-{
-   return -1;
-}
-
-static void
-mainloop_vt(struct vkcube *vc)
-{
-}
-
-#endif
 
 /* Swapchain-based code - shared between XCB and Wayland */
 
@@ -1800,6 +1835,7 @@ mainloop(struct vkcube *vc)
 #endif
    case DISPLAY_MODE_KMS:
       mainloop_vt(vc);
+      write_buffer(vc, &vc->buffers[0]);
       break;
    case DISPLAY_MODE_KHR:
       mainloop_khr(vc);
