@@ -584,16 +584,53 @@ init_kms(struct vkcube *vc)
       struct vkcube_buffer *b = &vc->buffers[i];
       int fd, stride, ret;
      
-      uint64_t mod = DRM_FORMAT_MOD_LINEAR;
+      //uint64_t mod = DRM_FORMAT_MOD_LINEAR;
+	uint64_t mod = I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS;
 
       uint32_t flags = 0;
       flags |=  GBM_BO_USE_SCANOUT |
 	      (vc->protected? GBM_BO_USE_PROTECTED : 0);
-      b->gbm_bo = gbm_bo_create_with_modifiers2(vc->gbm_device, vc->width, vc->height, GBM_FORMAT_XRGB8888, &mod, 1, flags);
+      b->gbm_bo = gbm_bo_create_with_modifiers2(vc->gbm_device, vc->width, vc->height, GBM_FORMAT_ABGR8888, &mod, 1, flags);
       
 
       fd = gbm_bo_get_fd(b->gbm_bo);
       stride = gbm_bo_get_stride(b->gbm_bo);
+
+      VkDrmFormatModifierPropertiesListEXT modifierList = {};
+      modifierList.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
+
+      VkFormatProperties2 formatProps= {};
+      formatProps.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+      formatProps.pNext = &modifierList;
+
+      vkGetPhysicalDeviceFormatProperties2(vc->physical_device, vc->image_format, &formatProps);
+
+      printf("modifierList.drmFormatModifierCount is %d \n", modifierList.drmFormatModifierCount);
+      uint32_t modifierCount = modifierList.drmFormatModifierCount;
+
+      VkDrmFormatModifierPropertiesEXT* modifiers = (VkDrmFormatModifierPropertiesEXT*)malloc (
+		      modifierCount * sizeof(VkDrmFormatModifierPropertiesEXT)
+		      );
+      modifierList.pDrmFormatModifierProperties = modifiers;
+      vkGetPhysicalDeviceFormatProperties2(vc->physical_device, vc->image_format, &formatProps);
+
+      VkFormatFeatureFlags requiredFeatures = 0;
+      for (uint32_t i=0; i< modifierCount; i++) {
+	      printf("modifiers[%ld].drmFormatModifier is : %d \n", i, modifiers[i].drmFormatModifier);
+		printf("I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS is %d. \n", I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS);	      
+	      if(modifiers[i].drmFormatModifier == I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS) {
+	      	printf("modifier is I915_Format_MOD_Y_TILED_GEN12_RC_CCS. \n");
+	   	requiredFeatures = modifiers[i].drmFormatModifierTilingFeatures;
+	      	printf("tilingFeature is %d \n", modifiers[i].drmFormatModifierTilingFeatures);
+	      }
+      }
+
+      if (formatProps.formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+      printf("supported for sampling\n");
+      } else {
+      printf("not supported for sampleing \n");
+      }
+
 
       VkImageCreateInfo img_info = {
 	      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -603,7 +640,8 @@ init_kms(struct vkcube *vc)
 	      .mipLevels = 1,
 	      .arrayLayers = 1,
 	      .samples = 1,
-	      .tiling = VK_IMAGE_TILING_LINEAR,
+	      //.tiling = VK_IMAGE_TILING_LINEAR,
+	      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
 	      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 	      .flags = vc->protected ? VK_IMAGE_CREATE_PROTECTED_BIT : 0,
       };
@@ -614,40 +652,55 @@ init_kms(struct vkcube *vc)
 
       img_info.pNext = &eimg;
 
-      VkSubresourceLayout plane_layouts[1] = {0};
-      plane_layouts[0].offset = 0;
-      plane_layouts[0].rowPitch = stride;
+      int offset0 = gbm_bo_get_offset(b->gbm_bo,0);
+      printf("offset0 is %d \n", offset0);
+      int offset1 = gbm_bo_get_offset(b->gbm_bo, 1);
+      printf("offset1 is %d \n", offset1);
+      int stride0 = gbm_bo_get_stride_for_plane(b->gbm_bo, 0);
+      printf("stride0 is %d \n", stride0);
+      int stride1 = gbm_bo_get_stride_for_plane(b ->gbm_bo, 1);
+      printf("stride1 is %d \n", stride1);
+      int bo_height = gbm_bo_get_height(b->gbm_bo);
+      printf("bo_height is %d \n ", bo_height);
+      
+      VkSubresourceLayout plane_layouts[2] = {0};
+      plane_layouts[0].offset = offset0;
+      plane_layouts[0].rowPitch = stride0;
       plane_layouts[0].arrayPitch = 0;
       plane_layouts[0].depthPitch = 0;
       plane_layouts[0].size = 0;
-
+      
+      plane_layouts[1].offset = offset1;
+      plane_layouts[1].rowPitch = stride1;
+      plane_layouts[1].arrayPitch = 0;
+      plane_layouts[1].depthPitch = 0;
+      plane_layouts[1].size = 0;
 
       VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info = {0};
       mod_info.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
-      mod_info.drmFormatModifierPlaneCount = 1;
+      mod_info.drmFormatModifierPlaneCount = 2;
       mod_info.drmFormatModifier = mod;
       mod_info.pPlaneLayouts = plane_layouts;
       eimg.pNext = &mod_info;
-      
-      vkCreateImage(vc->device, &img_info, NULL, &b->image);
+      VkResult result = vkCreateImage(vc->device, &img_info, NULL, &b->image);
+      VkImageMemoryRequirementsInfo2 imageInfo = {
+      	.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+	.pNext = NULL,
+	.image = b->image,
+      };
+printf("1.2 \n");
+      VkMemoryRequirements2 memRequirements = {
+      	.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+	.pNext = NULL
+      };
+printf("1.2.1 \n");
+      vkGetImageMemoryRequirements2(vc->device, &imageInfo, &memRequirements);
 
-      VkMemoryRequirements memRequirements;
-      vkGetImageMemoryRequirements(vc->device, b->image, &memRequirements);
-
-      VkImageSubresource subresource = {};
-      subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      subresource.mipLevel = 0;
-      subresource.arrayLayer = 0;
-
-      VkSubresourceLayout layout = {};
-
-      vkGetImageSubresourceLayout(vc->device, b->image, &subresource, &layout);
-
-      int32_t mem_type = choose_memory_type_index(vc, memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      int32_t mem_type = choose_memory_type_index(vc, memRequirements.memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
       VkMemoryAllocateInfo memi = {0};
       memi.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-      memi.allocationSize = memRequirements.size;
+      memi.allocationSize = memRequirements.memoryRequirements.size;
       memi.memoryTypeIndex = mem_type;
       
       VkImportMemoryFdInfoKHR importi = {0};
@@ -659,17 +712,24 @@ init_kms(struct vkcube *vc)
       vkAllocateMemory(vc->device, &memi, NULL, &b->mem);
       
       vkBindImageMemory(vc->device, b->image, b->mem, 0);
-      
+      printf("3 \n");
       close(fd);
-      b->stride = gbm_bo_get_stride(b->gbm_bo);
-      uint32_t bo_handles[4] = { gbm_bo_get_handle(b->gbm_bo).s32, };
-      uint32_t pitches[4] = { stride, };
-      uint32_t offsets[4] = { 0, };
-      ret = drmModeAddFB2(vc->fd, vc->width, vc->height,
+      
+     printf("handle1 is %d \n", gbm_bo_get_handle_for_plane(b->gbm_bo, 0));
+printf("handle2 is %d \n", gbm_bo_get_handle_for_plane(b->gbm_bo,1));
+      uint32_t bo_handles[4] = { gbm_bo_get_handle_for_plane(b->gbm_bo, 0).s32,gbm_bo_get_handle_for_plane(b->gbm_bo, 1).s32, };
+      
+      uint32_t pitches[4] = { stride0, stride1,0,0 };
+      uint32_t offsets[4] = { offset0, offset1, 0,0};
+      uint64_t drm_modifiers[4] = { mod, mod,0,0 };
+      ret = drmModeAddFB2WithModifiers(vc->fd, vc->width, vc->height,
                           DRM_FORMAT_XRGB8888, bo_handles,
-                          pitches, offsets, &b->fb, 0);
+                          pitches, offsets, drm_modifiers, &b->fb, DRM_MODE_FB_MODIFIERS);
 
+      printf("ret is %d \n", ret);
+      printf("fb is %d \n", &b->fb);
       fail_if(ret == -1, "addfb2 failed\n");
+      printf("5 \n");
       init_buffer(vc, b);
    }
    return 0;
